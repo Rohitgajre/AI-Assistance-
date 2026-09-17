@@ -1,0 +1,7 @@
+Return one JSON object only: no Markdown, explanation, or code fence. Use only
+the supplied document excerpts; do not infer facts. Start with a short factual
+executive_summary. Include any of these keys only when supported by the document:
+document_type, detailed_summary, key_findings, important_entities,
+dates_and_amounts, action_items, risks, classification. Use string values for
+summaries/classification and arrays of strings for list values. If no fact is
+available, use exactly "Information not found in the uploaded document."

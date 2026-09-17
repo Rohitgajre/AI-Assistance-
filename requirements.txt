@@ -1,0 +1,11 @@
+# Runtime dependencies for AskBuddy. Keep provider packages intentionally minimal.
+streamlit>=1.37,<2
+langchain-google-genai>=2,<4
+python-dotenv>=1,<2
+pypdf>=5,<7
+python-docx>=1,<2
+openpyxl>=3.1,<4
+python-pptx>=1,<2
+pytesseract>=0.3.10,<1
+pytest>=8,<9
+ruff>=0.8,<1

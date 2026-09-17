@@ -1,0 +1,16 @@
+[project]
+name = "askbuddy"
+version = "0.1.0"
+description = "A small Streamlit Q&A application using Google Gemini through LangChain."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
