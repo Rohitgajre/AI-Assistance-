@@ -35,21 +35,26 @@ def _build_chat_page() -> str:
       place-items: center;
     }
     .shell {
-      width: min(900px, 92vw);
-      background: rgba(15, 23, 42, 0.8);
-      border: 1px solid rgba(148, 163, 184, 0.2);
-      border-radius: 18px;
-      box-shadow: 0 30px 60px rgba(0,0,0,0.35);
+      width: min(1200px, 96vw);
+      background: rgba(11, 16, 28, 0.96);
+      border: 1px solid rgba(148, 163, 184, 0.16);
+      border-radius: 18px 18px 0 0;
+      box-shadow: 0 12px 28px rgba(0,0,0,0.35);
       overflow: hidden;
     }
     .topbar {
-      padding: 1rem 1.25rem;
-      border-bottom: 1px solid rgba(148,163,184,0.2);
-      background: rgba(17,24,39,0.9);
+      padding: 1.1rem 1.3rem 0.9rem;
+      border-bottom: 1px solid rgba(148,163,184,0.18);
+      background: rgba(15, 23, 42, 0.9);
     }
-    h1 { margin: 0; font-size: clamp(1.4rem, 2vw, 2rem); }
+    h1 {
+      margin: 0;
+      font-size: clamp(2rem, 2.6vw, 3rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+    }
     .content {
-      padding: 1rem;
+      padding: 1.1rem 1.2rem 1rem;
     }
     .chat {
       min-height: 320px;
@@ -57,50 +62,65 @@ def _build_chat_page() -> str:
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: 0.75rem;
-      padding: 0.75rem;
+      gap: 0.8rem;
+      padding: 0.8rem 0.1rem 0.2rem;
       border-radius: 12px;
-      background: rgba(17, 24, 39, 0.9);
-      border: 1px solid rgba(148,163,184,0.2);
+      background: transparent;
     }
     .bubble {
       max-width: 82%;
-      padding: 0.8rem 1rem;
+      padding: 0.9rem 1.1rem;
       border-radius: 16px;
-      line-height: 1.5;
+      line-height: 1.45;
       white-space: pre-wrap;
+      font-size: 1.02rem;
+      display: inline-block;
     }
-    .user { align-self: flex-end; background: var(--accent); }
-    .bot { align-self: flex-start; background: var(--card); }
+    .user {
+      align-self: flex-end;
+      background: linear-gradient(135deg, #8b5cf6, #7c3aed);
+      color: white;
+      box-shadow: 0 8px 20px rgba(124, 58, 237, 0.28);
+      border-bottom-right-radius: 12px;
+    }
+    .bot {
+      align-self: flex-start;
+      background: rgba(52, 65, 85, 0.9);
+      color: var(--text);
+      border-bottom-left-radius: 12px;
+    }
     form {
       display: flex;
-      gap: 0.75rem;
+      gap: 0.85rem;
       margin-top: 1rem;
     }
     textarea {
       flex: 1;
       border: 1px solid rgba(148,163,184,0.25);
       border-radius: 12px;
-      background: rgba(15, 23, 42, 0.8);
+      background: rgba(15, 23, 42, 0.85);
       color: var(--text);
       resize: vertical;
-      min-height: 56px;
-      padding: 0.9rem 1rem;
+      min-height: 62px;
+      padding: 0.95rem 1rem;
       font: inherit;
+      font-size: 1.05rem;
     }
     button {
       border: none;
       border-radius: 12px;
-      background: linear-gradient(135deg, var(--accent), #3b82f6);
+      background: linear-gradient(135deg, #8b5cf6, #7c3aed);
       color: white;
       font-weight: 700;
-      padding: 0.9rem 1.3rem;
+      padding: 0.9rem 1.5rem;
+      min-width: 120px;
       cursor: pointer;
+      font-size: 1rem;
     }
     .hint {
-      margin-top: 0.75rem;
+      margin-top: 0.8rem;
       color: var(--muted);
-      font-size: 0.9rem;
+      font-size: 0.95rem;
     }
   </style>
 </head>
@@ -111,7 +131,8 @@ def _build_chat_page() -> str:
     </div>
     <div class="content">
       <div id="chat" class="chat">
-        <div class="bubble bot">Hi! Ask a question and I’ll answer with the configured Gemini model.</div>
+        <div class="bubble bot">Hi! Ask a question and I'll answer with the configured Gemini model.</div>
+        <div class="bubble bot">Required runtime dependencies are not installed.</div>
       </div>
       <form id="chat-form">
         <textarea id="prompt" placeholder="Ask a question..." required></textarea>
