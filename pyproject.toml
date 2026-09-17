@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 testpaths = ["tests"]
 
 [tool.vercel]
-entrypoint = "AI_chatbot:main"
+entrypoint = "app:app"
 
 [tool.ruff]
 line-length = 100
