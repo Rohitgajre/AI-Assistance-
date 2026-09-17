@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import AI_chatbot
 from chat_service import ask_model
 
 
@@ -39,3 +40,7 @@ def test_ask_model_extracts_text_from_structured_content() -> None:
 def test_ask_model_rejects_empty_provider_content() -> None:
     with pytest.raises(ValueError, match="empty response"):
         ask_model(FakeModel("  "), "Hi")
+
+
+def test_main_does_not_expose_document_analysis_hook() -> None:
+    assert not hasattr(AI_chatbot, "render_document_analysis")

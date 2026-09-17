@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from chat_service import ask_model
-from document_analysis.ui import render_document_analysis
 
 load_dotenv()
 
@@ -49,7 +48,6 @@ def main() -> None:
     st.set_page_config(page_title="AskBuddy", page_icon="🤖")
     st.title("🤖 AskBuddy – AI Q&A Bot")
     st.caption("A conversational assistant powered by LangChain and Google Gemini.")
-    render_document_analysis()
 
     api_key = configured_api_key()
     if not api_key:
