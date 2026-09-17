@@ -1,38 +1,44 @@
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
 
-from fastapi import FastAPI
-from fastapi.responses import RedirectResponse
-from starlette.routing import Mount
 
-from AI_chatbot import main as run_streamlit
+async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+    """Minimal ASGI app for Vercel compatibility without third-party runtime deps."""
+    if scope.get("type") != "http":
+        return
 
-app = FastAPI(title="AskBuddy")
+    path = scope.get("path", "/")
+    if path in {"", "/"}:
+        payload = {
+            "message": "AskBuddy is configured for local Streamlit execution.",
+            "run": "streamlit run AI_chatbot.py",
+            "environment": {
+                "GOOGLE_API_KEY": "set"
+                if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+                else "missing",
+                "ASKBUDDY_MODEL": os.getenv("ASKBUDDY_MODEL", "gemini-3.6-flash"),
+            },
+        }
+        status_code = 200
+    elif path == "/health":
+        payload = {"status": "ok"}
+        status_code = 200
+    else:
+        payload = {"error": "Not found"}
+        status_code = 404
 
-
-@app.get("/")
-def root() -> RedirectResponse:
-    return RedirectResponse(url="/streamlit")
-
-
-@app.api_route("/streamlit", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
-async def streamlit_proxy() -> dict[str, str]:
-    # Vercel Python runtime cannot directly serve Streamlit UI as a web app.
-    # This route acts as a compatibility landing page for deployment checks,
-    # while the Streamlit app itself is intended to run locally with:
-    #   streamlit run AI_chatbot.py
-    return {
-        "message": "AskBuddy is configured for local Streamlit execution.",
-        "run": "streamlit run AI_chatbot.py",
-        "environment": {
-            "GOOGLE_API_KEY": "set" if os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") else "missing",
-            "ASKBUDDY_MODEL": os.getenv("ASKBUDDY_MODEL", "gemini-3.6-flash"),
-        },
-    }
-
-
-@app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+    body = json.dumps(payload).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [
+                (b"content-type", b"application/json; charset=utf-8"),
+                (b"content-length", str(len(body)).encode("ascii")),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
