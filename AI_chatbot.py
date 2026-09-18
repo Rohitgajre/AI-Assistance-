@@ -46,7 +46,7 @@ def initialise_chat_history() -> None:
 def main() -> None:
     """Render the application and process one user message per rerun."""
     st.set_page_config(page_title="AskBuddy", page_icon="🤖")
-    st.title("🤖 AskBuddy – AI Q&A Bot")
+    st.title("🤖 Ask Buddy – AI")
     st.caption("A conversational assistant powered by LangChain and Google Gemini.")
 
     api_key = configured_api_key()
