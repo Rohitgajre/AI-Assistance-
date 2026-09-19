@@ -1,0 +1,54 @@
+[client]
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[server]
+maxUploadSize = 50
+
+[theme]
+base = "dark"
+primaryColor = "#8ab4f8"
+backgroundColor = "#131314"
+secondaryBackgroundColor = "#1e1f20"
+textColor = "#e3e3e3"
+linkColor = "#a8c7fa"
+borderColor = "#2d2f31"
+showWidgetBorder = false
+showSidebarBorder = false
+baseRadius = "1.25rem"
+buttonRadius = "full"
+font = "'Google Sans', 'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Google Sans', 'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 16
+baseFontWeight = 400
+headingFontSizes = ["2.75rem", "1.5rem", "1.2rem", "1rem", "0.95rem", "0.85rem"]
+headingFontWeights = [400, 500, 500, 500, 500, 500]
+linkUnderline = false
+blueColor = "#8ab4f8"
+greenColor = "#81c995"
+redColor = "#f28b82"
+yellowColor = "#fdd663"
+violetColor = "#c58af9"
+grayColor = "#9aa0a6"
+dataframeHeaderBackgroundColor = "#1e1f20"
+chartCategoricalColors = ["#8ab4f8", "#81c995", "#fdd663", "#c58af9", "#f28b82", "#78d9ec", "#fbbc04"]
+
+[theme.sidebar]
+backgroundColor = "#1b1b1b"
+secondaryBackgroundColor = "#2a2a2a"
+borderColor = "#2a2a2a"
+textColor = "#e3e3e3"
+primaryColor = "#8ab4f8"
+
+[theme.light]
+primaryColor = "#1a73e8"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f4f9"
+textColor = "#1f1f1f"
+borderColor = "#d3e3fd"
+
+[theme.light.sidebar]
+backgroundColor = "#f8fafd"
+secondaryBackgroundColor = "#e9eef6"
+textColor = "#1f1f1f"
