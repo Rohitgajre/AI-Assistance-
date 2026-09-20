@@ -1,90 +1,152 @@
-# AskBuddy
+# AskBuddy — Bank Statement Processing & Classification System
 
-AskBuddy is a small Streamlit chat application that sends a question to Google
-Gemini via LangChain and keeps the conversation visible for the current browser
-session. It is intentionally a focused application, not a database-backed or
-authenticated service.
+A fully functional prototype that processes bank statement PDFs (both text-based
+and image-based / scanned), extracts account and transaction data, classifies
+transactions with **non-LLM** approaches, and exports the results to **Excel**
+and **CSV**.
+
+AskBuddy is packaged as a small Streamlit application with three parts:
+
+- **Bank-statement pipeline** — extraction, classification, and export
+  (`bank_statement_processor.py`)
+- **Gemini chat** — ask natural-language questions about the processed statement
+- **Document analysis (optional)** — grounded Q&A over other document types using
+  a local Ollama model
 
 ## Features
 
-- Gemini model selection through `ASKBUDDY_MODEL`
-- Per-session conversation history and a clear-conversation control
-- Reusable model client, bounded retries, and a request timeout
-- Friendly provider-error handling without displaying secrets or stack traces
-- Unit tests for the provider-independent response boundary
+### Input handling (§3.1)
+
+- Accepts bank-statement PDFs from multiple banks and layouts.
+- Supports **text-based** and **image-based (scanned)** PDFs.
+- **Auto-detects** PDF type (text vs. image) and routes scanned pages to the
+  built-in OCR engine when native text is missing.
+- Other upload types are accepted in chat: TXT, DOCX, CSV, XLSX, PNG, JPG.
+
+### Data extraction (§3.2)
+
+- Account holder details: bank name, account holder name, account number, IFSC.
+- Transaction table data: **date, description, debit amount, credit amount,
+  balance**.
+- Multiple extraction strategies per layout (line parsing, date-window parsing,
+  embedded PDF table extraction) with deduplication, plus running-balance
+  validation warnings.
+
+### OCR (hardcoded, generic)
+
+- The document OCR engine is **hardcoded to RapidOCR** (ONNX runtime, models
+  shipped with the wheel). No system executable such as Tesseract needs to be
+  installed.
+- The same engine powers image uploads, scanned-PDF fallback in the bank
+  pipeline, and the document-analysis extractors.
+- A Tesseract binary on `PATH` is used only as an *optional* fallback.
+
+### Classification engine — non-LLM (§3.3)
+
+Transactions are classified **without LLMs** using a hybrid approach:
+
+1. **Heuristic rule-based matching** — curated keyword rules per category
+   (Salary, Entertainment, Housing, Transport, Bills, Cash Withdrawal,
+   Groceries, Food, Shopping, Healthcare, Insurance, Investment, Transfer,
+   Interest, Bank Charges, Income, Other Expense, Unknown).
+2. **Traditional machine learning** — a multinomial **Naive Bayes** model trained
+   on a compact in-code corpus; used when heuristics are not confident.
+
+The winning category and confidence are assigned per transaction. The method used
+(heuristic vs. machine learning) is tracked internally and never shown in the
+export output.
+
+### Output requirements (§4)
+
+Export processed data in:
+
+- **Excel (`.xlsx`)** — a Summary sheet plus a Transactions sheet
+- **CSV (`.csv`)**
+
+Export columns: `date`, `description`, `debit_amount`, `credit_amount`,
+`balance`, `category`, `confidence`.
+
+### Key features (§5)
+
+- Upload and process bank statements
+- Auto-detect PDF type (text vs. image)
+- Accurate extraction with fallbacks for unusual layouts
+- Transaction classification without LLMs
+- Export to Excel/CSV
+- Running-balance arithmetic warnings (edge-case detection)
+- Password-protected PDF handling
+- Gemini-powered Q&A over the extracted statement
 
 ## Architecture
 
-`AI_chatbot.py` is the Streamlit entry point. It loads local configuration,
-renders the UI, and owns session state. `chat_service.py` contains the small,
-testable model-invocation boundary. Gemini is an external integration; no API,
-database, authentication system, document ingestion pipeline, or vector store is
-present in this repository.
+```
+AI_chatbot.py                Streamlit entry point: UI, session state, routing
+bank_statement_processor.py  Extraction + classification + export pipeline
+document_analysis/           Optional isolated document analysis (Ollama)
+chat_service.py              Small Gemini provider boundary
+```
+
+`bank_statement_processor.py` is the assessment core: it parses PDFs with pypdf
+(+ pymupdf rasterization for OCR), classifies with heuristics and a multinomial
+Naive Bayes model, and exports with the standard library CSV module or openpyxl.
 
 ## Requirements
 
 - Python 3.10 or newer
-- A Google Gemini API key
+- A Google Gemini API key (`GOOGLE_API_KEY`, or `GEMINI_API_KEY`)
+- Optional: Ollama for the document-analysis panel
 
 ## Local setup
 
-```bash
+```powershell
 python -m venv .venv
 .venv\Scripts\activate  # PowerShell on Windows
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Set `GOOGLE_API_KEY` in `.env`. `GEMINI_API_KEY` is also accepted. To select a
-different supported model, set `ASKBUDDY_MODEL`; otherwise AskBuddy uses
-`gemini-2.5-flash`.
+Set `GOOGLE_API_KEY` in `.env`. To select a different Gemini model, set
+`ASKBUDDY_MODEL` (default: `gemini-3.6-flash`).
 
 Run the app:
 
-```bash
+```powershell
 streamlit run AI_chatbot.py
 ```
 
-## Development and testing
+Drop a bank-statement PDF into the chat and ask to process it, or use the
+`bank_statement_processor` functions directly from Python:
 
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest
-python -m ruff check .
+```python
+from bank_statement_processor import BankStatementProcessor
+
+processor = BankStatementProcessor()
+statement = processor.process_pdf(pdf_bytes, "statement.pdf")
+processor.export_transactions(statement, "output/statement.xlsx")
 ```
 
-Tests do not call Gemini or require an API key. Before deployment, use your
-platform's secret manager for the API key, set a resource limit and HTTPS at the
-hosting layer, and verify the chosen model is enabled for the deployed key.
+## Optional document analysis (Ollama)
 
-## Troubleshooting
-
-- **Missing key:** create `.env` from `.env.example` and set one supported key.
-- **Provider error:** verify the key, network access, quota, and model name.
-- **Dependencies fail to install:** use a supported Python version in a clean
-  virtual environment.
-
-See [PROJECT_AUDIT_REPORT.md](PROJECT_AUDIT_REPORT.md) for the production-readiness audit.
-
-## Local document analysis with Ollama
-
-The optional **Document analysis** panel in the sidebar accepts PDF, DOCX, TXT,
-Markdown, CSV, XLSX, PPTX, and image uploads. Files are processed in memory for
-the current browser session; their original bytes are never written to disk.
-
-Install the additional parsers, then install and start Ollama separately:
+The sidebar **Document analysis** panel accepts PDF, DOCX, TXT, Markdown, CSV,
+XLSX, PPTX, and image uploads, processes them in memory, and answers questions
+with a local Ollama model.
 
 ```powershell
-python -m pip install -r requirements.txt
 ollama pull llama3.1:8b
 ollama serve
 ```
 
-In a second terminal, start AskBuddy as usual. Optional settings in `.env` are
-`OLLAMA_BASE_URL`, `OLLAMA_MODEL`, and `OLLAMA_TIMEOUT`; they do not affect the
-Gemini chat. OCR additionally requires the Tesseract system executable to be
-installed and available on `PATH`.
+Optional `.env` settings: `OLLAMA_BASE_URL`, `OLLAMA_MODEL`, `OLLAMA_TIMEOUT`.
+These do not affect the Gemini chat.
 
-Upload a document in the sidebar, select **Process upload**, then either
-**Analyze document** or ask a grounded question. If Ollama is unavailable, only
-that action fails with a clear message; Gemini chat remains available.
+## Development and testing
+
+```powershell
+python -m pip install -r requirements.txt
+python -m pytest
+python -m ruff check .
+```
+
+Tests do not call Gemini or Ollama and do not require API keys. OCR engine tests
+run against mocked backends; a real end-to-end OCR check needs RapidOCR models,
+which are downloaded on first use.

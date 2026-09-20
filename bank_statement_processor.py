@@ -1,7 +1,7 @@
 """Bank statement extraction, classification, and export.
 
-The pipeline is LLM-free: PDFs are parsed with pypdf and optional OCR,
-transactions are classified with heuristics plus a multinomial Naive Bayes
+The pipeline is LLM-free: PDFs are parsed with pypdf and the built-in RapidOCR
+engine, transactions are classified with heuristics plus a multinomial Naive Bayes
 model, and results export to CSV or Excel.
 """
 
@@ -162,7 +162,6 @@ EXPORT_FIELDS = (
     "credit_amount",
     "balance",
     "category",
-    "classification_method",
     "confidence",
 )
 
@@ -186,7 +185,6 @@ class Transaction:
             "credit_amount": self.credit_amount,
             "balance": self.balance,
             "category": self.category,
-            "classification_method": self.classification_method,
             "confidence": round(self.confidence, 3),
         }
 
@@ -259,16 +257,7 @@ def _tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9]{2,}", text.lower())
 
 
-_RAPID_OCR = None
 
-
-def _rapidocr_engine():
-    global _RAPID_OCR
-    if _RAPID_OCR is None:
-        from rapidocr import RapidOCR
-
-        _RAPID_OCR = RapidOCR()
-    return _RAPID_OCR
 
 
 def _training_corpus() -> tuple[list[str], list[str]]:
@@ -940,116 +929,18 @@ class BankStatementProcessor:
 
     @staticmethod
     def _ocr_pdf(pdf_bytes: bytes, password: str = "") -> list[str]:
-        images = BankStatementProcessor._rasterize_pdf(pdf_bytes, password)
-        ocr_text_parts: list[str] = []
-        for image in images:
-            text = BankStatementProcessor._ocr_image(image)
-            if text:
-                ocr_text_parts.append(text)
-        if not ocr_text_parts:
-            raise ValueError("No readable text was found in the scanned PDF.")
-        return ocr_text_parts
+        from document_analysis.extractors.ocr_engine import ocr_pdf
 
-    @staticmethod
-    def _rasterize_pdf(pdf_bytes: bytes, password: str = ""):
-        try:
-            import pymupdf
-        except ImportError as error:
-            raise ValueError("PDF rendering is unavailable. Install pymupdf to process scanned statements.") from error
-
-        document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
-        BankStatementProcessor._unlock_pdf(document, password)
-        images = []
-        zoom = pymupdf.Matrix(2, 2)
-        for page in document:
-            pixmap = page.get_pixmap(matrix=zoom, alpha=False)
-            from PIL import Image
-
-            image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-            images.append(image)
-        if not images:
-            raise ValueError("The PDF has no pages to read.")
-        return images
+        return ocr_pdf(pdf_bytes, password)
 
     @staticmethod
     def _ocr_image(image) -> str:
-        rapid_text = BankStatementProcessor._ocr_with_rapidocr(image)
-        if rapid_text:
-            return rapid_text
-        try:
-            import pytesseract
+        from document_analysis.extractors.ocr_engine import ocr_image
 
-            return pytesseract.image_to_string(image).strip()
+        try:
+            return ocr_image(image)
         except Exception:
             return ""
-
-    @staticmethod
-    def _ocr_text_from_boxes(result: object) -> str:
-        boxes = getattr(result, "boxes", None)
-        texts = getattr(result, "txts", None)
-        if boxes is None or texts is None:
-            return ""
-        items: list[tuple[float, float, str]] = []
-        for box, text in zip(boxes, texts, strict=False):
-            token = str(text).strip()
-            if not token:
-                continue
-            try:
-                points = list(box)
-                ys = [float(point[1]) for point in points]
-                xs = [float(point[0]) for point in points]
-            except Exception:
-                continue
-            items.append((sum(ys) / max(len(ys), 1), sum(xs) / max(len(xs), 1), token))
-        if not items:
-            return ""
-        items.sort(key=lambda item: (round(item[0] / 12.0), item[1]))
-        lines: list[str] = []
-        current_key: int | None = None
-        current: list[tuple[float, str]] = []
-        for y, x, token in items:
-            key = int(round(y / 12.0))
-            if current_key is None or key == current_key:
-                current.append((x, token))
-                current_key = key if current_key is None else current_key
-                continue
-            current.sort()
-            lines.append(" ".join(part for _x, part in current))
-            current = [(x, token)]
-            current_key = key
-        if current:
-            current.sort()
-            lines.append(" ".join(part for _x, part in current))
-        return "\n".join(lines).strip()
-
-    @staticmethod
-    def _ocr_with_rapidocr(image) -> str:
-        try:
-            import numpy as np
-
-            engine = _rapidocr_engine()
-        except Exception:
-            return ""
-        result = engine(np.array(image))
-        boxed = BankStatementProcessor._ocr_text_from_boxes(result)
-        if boxed:
-            return boxed
-        texts = getattr(result, "txts", None)
-        if texts:
-            return "\n".join(str(item).strip() for item in texts if str(item).strip())
-        payload = result[0] if isinstance(result, tuple) else result
-        if payload is None:
-            return ""
-        lines: list[str] = []
-        for item in payload:
-            if isinstance(item, str):
-                lines.append(item)
-                continue
-            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                text = item[1]
-                if isinstance(text, str):
-                    lines.append(text)
-        return "\n".join(line.strip() for line in lines if str(line).strip())
 
     @staticmethod
     def _normalize_date(raw_date: str) -> str:
