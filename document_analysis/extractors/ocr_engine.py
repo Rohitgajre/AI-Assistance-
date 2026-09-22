@@ -84,6 +84,42 @@ def rasterize_pdf(pdf_bytes: bytes, password: str = "") -> list[Any]:
     return images
 
 
+def _tokens_from_result(result: object) -> list[dict[str, float | str]]:
+    """Normalize a RapidOCR result into token dicts with box coordinates.
+
+    Each token keeps ``text`` plus its bounding box (``x0``/``x1``/``y0``/``y1``)
+    and center (``cx``/``cy``) so downstream consumers can reconstruct lines,
+    detect column boundaries, or re-sort tokens without re-running OCR.
+    """
+    boxes = getattr(result, "boxes", None)
+    texts = getattr(result, "txts", None)
+    if boxes is None or texts is None:
+        return []
+    tokens: list[dict[str, float | str]] = []
+    for box, text in zip(boxes, texts, strict=False):
+        token = str(text).strip()
+        if not token:
+            continue
+        try:
+            points = list(box)
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+        except Exception:
+            continue
+        tokens.append(
+            {
+                "text": token,
+                "x0": min(xs),
+                "x1": max(xs),
+                "y0": min(ys),
+                "y1": max(ys),
+                "cx": sum(xs) / max(len(xs), 1),
+                "cy": sum(ys) / max(len(ys), 1),
+            }
+        )
+    return tokens
+
+
 def text_from_boxes(result: object) -> str:
     """Reconstruct readable lines from RapidOCR box results.
 
@@ -91,42 +127,71 @@ def text_from_boxes(result: object) -> str:
     sorted left-to-right inside each line, which preserves the reading order
     that matters for tables such as bank statements.
     """
-    boxes = getattr(result, "boxes", None)
-    texts = getattr(result, "txts", None)
-    if boxes is None or texts is None:
-        return ""
-    items: list[tuple[float, float, str]] = []
-    for box, text in zip(boxes, texts, strict=False):
-        token = str(text).strip()
-        if not token:
-            continue
-        try:
-            points = list(box)
-            ys = [float(point[1]) for point in points]
-            xs = [float(point[0]) for point in points]
-        except Exception:
-            continue
-        items.append((sum(ys) / max(len(ys), 1), sum(xs) / max(len(xs), 1), token))
-    if not items:
-        return ""
-    items.sort(key=lambda item: (round(item[0] / _LINE_BUCKET), item[1]))
-    lines: list[str] = []
+    lines = lines_from_result(result)
+    return "\n".join(" ".join(str(token["text"]) for token in line) for line in lines).strip()
+
+
+def lines_from_result(result: object) -> list[list[dict[str, float | str]]]:
+    """Group OCR tokens into reading-order lines, keeping per-token coordinates.
+
+    Returns a list of lines; every line is a list of token dicts (see
+    ``_tokens_from_result``) already sorted left-to-right. Consumers that need
+    column-aware table extraction can use the ``cx`` values directly.
+    """
+    tokens = _tokens_from_result(result)
+    if not tokens:
+        return []
+    tokens.sort(key=lambda item: (round(float(item["cy"]) / _LINE_BUCKET), float(item["cx"])))
+    lines: list[list[dict[str, float | str]]] = []
     current_key: int | None = None
-    current: list[tuple[float, str]] = []
-    for y, x, token in items:
-        key = int(round(y / _LINE_BUCKET))
+    for token in tokens:
+        key = int(round(float(token["cy"]) / _LINE_BUCKET))
         if current_key is None or key == current_key:
-            current.append((x, token))
-            current_key = key if current_key is None else current_key
+            if current_key is None:
+                current_key = key
+                lines.append([])
+            lines[-1].append(token)
             continue
-        current.sort()
-        lines.append(" ".join(part for _x, part in current))
-        current = [(x, token)]
+        lines.append([token])
         current_key = key
-    if current:
-        current.sort()
-        lines.append(" ".join(part for _x, part in current))
-    return "\n".join(lines).strip()
+    for line in lines:
+        line.sort(key=lambda item: float(item["cx"]))
+    return lines
+
+
+def ocr_image_lines(image: Any) -> list[list[dict[str, float | str]]]:
+    """OCR an image and return per-line token records (coordinates preserved).
+
+    Returns ``[]`` when the backend produced no boxed text; callers then fall
+    back to the plain-text path.
+    """
+    prepared = _prepare_image(image)
+    try:
+        import numpy as np
+
+        engine = _engine()
+    except OCRUnavailableError:
+        raise
+    except Exception as error:
+        raise OCRUnavailableError("The built-in OCR engine could not start.") from error
+    result = engine(np.array(prepared))
+    return lines_from_result(result)
+
+
+def ocr_pdf_lines(
+    pdf_bytes: bytes,
+    password: str = "",
+) -> list[list[list[dict[str, float | str]]]]:
+    """OCR every page and return per-page line records with coordinates."""
+    from PIL import Image
+
+    pages: list[list[list[dict[str, float | str]]]] = []
+    for image in rasterize_pdf(pdf_bytes, password):
+        if isinstance(image, Image.Image):
+            lines = ocr_image_lines(image)
+            if lines:
+                pages.append(lines)
+    return pages
 
 
 def _engine() -> Any:

@@ -182,3 +182,92 @@ def test_process_pdf_accepts_generated_statement() -> None:
     assert statement.account_number == "123456789012"
     assert len(statement.transactions) >= 4
     assert statement.transactions[0].category == "Salary"
+
+
+CSV_ROWS = [
+    ["Date", "Description", "Debit", "Credit", "Balance"],
+    ["03/09/2024", "SALARY CREDIT", "0.00", "50000.00", "250000.00"],
+    ["05/09/2024", "AMAZON PAY", "2999.00", "0.00", "247001.00"],
+    ["07/09/2024", "PETROL PUMP", "1500.00", "0.00", "245501.00"],
+]
+
+
+def test_process_tabular_csv_parses_transactions_and_classifies() -> None:
+    processor = BankStatementProcessor()
+    statement = processor.process_tabular(CSV_ROWS, "statement.csv")
+
+    assert statement.document_type == "tabular"
+    assert len(statement.transactions) == 3
+    assert statement.transactions[0].credit_amount == 50000.0
+    assert statement.transactions[0].category == "Salary"
+    assert statement.transactions[0].confidence > 0
+    assert statement.transactions[1].category == "Shopping"
+    assert statement.transactions[2].category == "Transport"
+
+
+def test_process_tabular_debit_credit_without_balance() -> None:
+    rows = [
+        ["Value Date", "Narration", "Debit", "Credit"],
+        ["03/09/2024", "UPI/SWIGGY/FOOD", "450.00", "0.00"],
+        ["04/09/2024", "NEFT SALARY ACME", "0.00", "75000.00"],
+    ]
+    statement = BankStatementProcessor().process_tabular(rows, "no-balance.csv")
+
+    assert len(statement.transactions) == 2
+    assert statement.transactions[0].debit_amount == 450.0
+    assert statement.transactions[0].category == "Food"
+    assert statement.transactions[1].credit_amount == 75000.0
+    assert statement.transactions[1].category == "Salary"
+
+
+def test_process_tabular_excel_export(tmp_path: Path) -> None:
+    from openpyxl import Workbook, load_workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Txn Date", "Narration", "Withdrawal", "Deposit", "Balance"])
+    sheet.append(["03/09/2024", "ATM CASH WITHDRAWAL", "2000.00", "0.00", "248000.00"])
+    sheet.append(["05/09/2024", "INTEREST CREDIT", "0.00", "1250.00", "249250.00"])
+    path = tmp_path / "statement.xlsx"
+    workbook.save(path)
+
+    loaded = load_workbook(path, read_only=True, data_only=True)
+    rows = [list(row) for sheet in loaded.worksheets for row in sheet.iter_rows(values_only=True)]
+    loaded.close()
+
+    statement = BankStatementProcessor().process_tabular(rows, "statement.xlsx")
+
+    assert len(statement.transactions) == 2
+    assert statement.transactions[0].debit_amount == 2000.0
+    assert statement.transactions[0].category == "Cash Withdrawal"
+    assert statement.transactions[1].credit_amount == 1250.0
+    assert statement.transactions[1].category == "Interest"
+
+
+def test_process_image_statement_uses_ocr(monkeypatch) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    buffer = BytesIO()
+    Image.new("RGB", (120, 40), "white").save(buffer, format="PNG")
+
+    processor = BankStatementProcessor()
+    monkeypatch.setattr(processor, "_ocr_image", lambda image: SAMPLE_TEXT)
+
+    statement = processor.process_image(buffer.getvalue(), "statement.png")
+
+    assert statement.document_type == "image"
+    assert statement.account_number == "123456789012"
+    assert len(statement.transactions) == 4
+
+
+def test_process_image_statement_raises_when_invalid() -> None:
+    processor = BankStatementProcessor()
+
+    try:
+        processor.process_image(b"", "blank.png")
+    except ValueError as error:
+        assert "empty" in str(error).lower()
+    else:
+        raise AssertionError("Expected empty image bytes to raise ValueError")

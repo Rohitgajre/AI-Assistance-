@@ -25,9 +25,12 @@ DEFAULT_MODEL: Final = "gemini-3.6-flash"
 MODEL_ENV_VAR: Final = "ASKBUDDY_MODEL"
 API_KEY_ENV_VARS: Final = ("GOOGLE_API_KEY", "GEMINI_API_KEY")
 CHAT_FILE_TYPES: Final = ["pdf", "application/pdf", "txt", "docx", "csv", "xlsx", "png", "jpg", "jpeg"]
+STATEMENT_EXTENSIONS: Final = frozenset({"pdf", "txt", "csv", "xlsx", "png", "jpg", "jpeg", "webp"})
+SPREADSHEET_EXTENSIONS: Final = frozenset({"csv", "xlsx"})
+IMAGE_EXTENSIONS: Final = frozenset({"png", "jpg", "jpeg", "webp"})
 
 SUGGESTIONS = {
-    "Process a bank statement": "Process the attached bank statement PDF and classify every transaction.",
+    "Process a bank statement": "Process the attached bank statement and classify every transaction.",
     "Summarize spending": "Summarize spending by category from the processed statement.",
     "Export a recap": "Give me a short recap I can keep with the Excel export.",
     "Ask about a document": "What are the key findings in the uploaded file?",
@@ -136,6 +139,7 @@ def clear_chat_state() -> None:
     st.session_state.document_loaded = False
     st.session_state.bank_statement = None
     st.session_state.pending_prompt = ""
+    st.session_state.pop("_last_turn", None)
 
 
 def get_document_context(document_record: object) -> str:
@@ -208,12 +212,42 @@ def payload_to_transactions(payload: dict[str, Any]) -> list[Transaction]:
     return [Transaction(**row) for row in payload.get("transactions", [])]
 
 
+def file_extension(name: str) -> str:
+    """Return the lower-cased extension of a filename (``""`` when absent)."""
+    return name.lower().rsplit(".", 1)[-1] if "." in name else ""
+
+
+def read_statement_rows(name: str, data: bytes) -> list[list[object]]:
+    """Read CSV/XLSX cells into rows for tabular statement processing."""
+    extension = file_extension(name)
+    if extension == "csv":
+        import csv
+        from io import StringIO
+
+        return [list(row) for row in csv.reader(StringIO(data.decode("utf-8-sig", errors="replace")))]
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(BytesIO(data), read_only=True, data_only=True)
+    rows: list[list[object]] = []
+    for sheet in workbook.worksheets:
+        rows.extend(list(row) for row in sheet.iter_rows(values_only=True))
+    return rows
+
+
 def process_bank_file(uploaded_file, password: str = "") -> BankStatement:
+    """Route any supported statement upload (PDF/CSV/XLSX/TXT/image) to the processor."""
     processor = get_processor()
     name = uploaded_file.name
     data = uploaded_file.getvalue()
-    if name.lower().endswith(".pdf") or b"%PDF" in data[:1024]:
+    extension = file_extension(name)
+    if extension == "pdf" or b"%PDF" in data[:1024]:
         return processor.process_pdf(data, name, password=password)
+    if extension in SPREADSHEET_EXTENSIONS:
+        return processor.process_tabular(read_statement_rows(name, data), name)
+    if extension in IMAGE_EXTENSIONS:
+        return processor.process_image(data, name)
     return processor.process_text(data.decode("utf-8", errors="ignore"), name)
 
 
@@ -257,7 +291,7 @@ def render_empty_state() -> None:
         <div class="hero-wrap">
             <div class="hero-kicker">AskBuddy</div>
             <p class="hero-title">Hello, how can I help you today?</p>
-            <p class="hero-sub">Attach a bank statement PDF, or ask anything about your documents.</p>
+            <p class="hero-sub">Attach a bank statement (PDF, CSV, Excel, TXT, or image), or ask anything about your documents.</p>
         </div>
         """
     )
@@ -375,10 +409,11 @@ def consume_prompt(prompt: Any) -> tuple[str, list[Any]]:
     return text, files
 
 
-def is_pdf(uploaded_file) -> bool:
-    name = uploaded_file.name.lower()
+def is_statement_file(uploaded_file) -> bool:
+    """True when the upload looks like a bank statement rather than a general document."""
+    name = uploaded_file.name
     data = uploaded_file.getvalue()
-    return name.endswith(".pdf") or b"%PDF" in data[:1024]
+    return file_extension(name) in STATEMENT_EXTENSIONS or b"%PDF" in data[:1024]
 
 
 def handle_turn(user_text: str, files: list[Any]) -> None:
@@ -392,7 +427,7 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
     statement_payload_data = None
     status_notes: list[str] = []
     for item in files:
-        if is_pdf(item):
+        if is_statement_file(item):
             try:
                 statement = process_bank_file(
                     item,
@@ -401,7 +436,7 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
                 statement_payload_data = statement_payload(statement)
                 st.session_state.bank_statement = statement_payload_data
                 status_notes.append(
-                    f"Processed **{item.name}** as a {statement.document_type} PDF "
+                    f"Processed **{item.name}** as a {statement.document_type} statement "
                     f"with {len(statement.transactions)} classified transactions."
                 )
             except Exception as error:
@@ -416,7 +451,7 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
     with st.chat_message("assistant", avatar=":material/auto_awesome:"):
         with st.status(":shimmer[Thinking]", type="compact") as status:
             if statement_payload_data:
-                with st.status("Reading PDF and classifying transactions", type="step"):
+                with st.status("Reading statement and classifying transactions", type="step"):
                     st.caption("Heuristic rules plus multinomial Naive Bayes. Scanned pages use built-in OCR.")
                 status.update(label="Done", state="complete")
             else:
@@ -429,7 +464,7 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
             render_statement_card(statement_payload_data, key_prefix="live")
             assistant_text = intro or "Statement processed."
         elif not files and "bank statement" in question.lower() and not st.session_state.get("bank_statement"):
-            assistant_text = "Attach a bank statement PDF with the + button, then send. Password-protected files can be unlocked in Settings."
+            assistant_text = "Attach a bank statement (PDF, CSV, Excel, TXT, or image) with the + button, then send. Password-protected files can be unlocked in Settings."
             st.markdown(assistant_text)
         elif configured_api_key():
             answer = generate_response(build_prompt(question))
@@ -437,7 +472,8 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
             assistant_text = answer
         else:
             assistant_text = (
-                "Attach a bank statement PDF with the + button to extract and classify transactions. "
+                "Attach a bank statement (PDF, CSV, Excel, TXT, or image) with the + button "
+                "to extract and classify transactions. "
                 "Set GOOGLE_API_KEY to chat as well."
             )
             st.markdown(assistant_text)
@@ -469,7 +505,7 @@ def main() -> None:
         render_messages()
 
     prompt = st.chat_input(
-        "Ask anything, or attach a bank statement PDF",
+        "Ask anything, or attach a bank statement (PDF, CSV, Excel, TXT, or image)",
         accept_file="multiple",
         file_type=CHAT_FILE_TYPES,
         max_upload_size=50,
@@ -484,8 +520,11 @@ def main() -> None:
 
     user_text, files = consume_prompt(prompt)
     if user_text or files:
-        handle_turn(user_text, files)
-        st.rerun()
+        signature = (user_text, tuple(sorted(item.name for item in files)))
+        if st.session_state.get("_last_turn") != signature:
+            st.session_state._last_turn = signature
+            handle_turn(user_text, files)
+            st.rerun()
 
 
 if __name__ == "__main__":
