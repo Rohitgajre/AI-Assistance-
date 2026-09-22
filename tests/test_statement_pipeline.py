@@ -295,6 +295,18 @@ def test_account_number_extraction_edge_cases() -> None:
     assert statement.account_number == "12345678"
 
 
+def test_account_number_extraction_skips_activity_false_match() -> None:
+    """A bare ``ac`` prefix must not match inside words such as "Activity"."""
+    processor = BankStatementProcessor()
+    text = (
+        "Activity for Relationship Checking - Account #12345678\n"
+        "Date Description Debit Credit Balance\n"
+        "10/02 POS PURCHASE 500.00 0.00 9500.00\n"
+    )
+    statement = processor.process_text(text, "account_sample.txt")
+    assert statement.account_number == "12345678"
+
+
 def test_balance_mismatch_warnings() -> None:
     text = """
     HDFC BANK

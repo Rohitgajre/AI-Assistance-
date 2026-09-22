@@ -209,3 +209,4 @@ __marimo__/
 .env.example
 !.env.example
 .env.example
+*.pdf

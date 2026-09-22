@@ -467,9 +467,13 @@ def handle_turn(user_text: str, files: list[Any]) -> None:
             assistant_text = "Attach a bank statement (PDF, CSV, Excel, TXT, or image) with the + button, then send. Password-protected files can be unlocked in Settings."
             st.markdown(assistant_text)
         elif configured_api_key():
-            answer = generate_response(build_prompt(question))
-            st.write_stream(stream_text(answer))
-            assistant_text = answer
+            try:
+                answer = generate_response(build_prompt(question))
+                st.write_stream(stream_text(answer))
+                assistant_text = answer
+            except Exception as error:
+                st.error(f"Chat failed: {error}")
+                assistant_text = f"Chat failed: {error}"
         else:
             assistant_text = (
                 "Attach a bank statement (PDF, CSV, Excel, TXT, or image) with the + button "
@@ -520,10 +524,13 @@ def main() -> None:
 
     user_text, files = consume_prompt(prompt)
     if user_text or files:
-        signature = (user_text, tuple(sorted(item.name for item in files)))
+        signature = (user_text, tuple(sorted((item.name, item.size) for item in files)))
         if st.session_state.get("_last_turn") != signature:
-            st.session_state._last_turn = signature
             handle_turn(user_text, files)
+            # Record the signature only after a successful turn, so a failed
+            # attempt (e.g. an error banner) can always be retried. This also
+            # blocks the duplicate pass on the script rerun that follows.
+            st.session_state._last_turn = signature
             st.rerun()
 
 

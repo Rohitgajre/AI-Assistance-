@@ -137,7 +137,7 @@ _REF_LABEL_RE = re.compile(
 
 _IFSC = re.compile(r"\b([A-Z]{4}0[A-Z0-9]{6})\b")
 _ACCOUNT_NO = re.compile(
-    r"(?:account\s*(?:no\.?|number|#)|a/?c(?:\s*no\.?)?|acct\.?\s*no\.?)\s*[:\-]?\s*"
+    r"(?:account\s*(?:no\.?|number|#)|a/c(?:\s*no\.?)?|acct\.?\s*no\.?)\s*[:\-]?\s*"
     r"([A-Z0-9Xx*]{6,22})",
     re.IGNORECASE,
 )
