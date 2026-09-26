@@ -9,7 +9,7 @@ from PIL import Image
 from document_analysis.config import OllamaSettings
 from document_analysis.exceptions import InvalidDocumentError, OllamaUnavailableError
 from document_analysis.extractors.image_extractor import extract_image
-from document_analysis.extractors.ocr_engine import text_from_boxes
+from document_analysis.extractors.ocr_engine import lines_from_result, text_from_boxes
 from document_analysis.extractors.pdf_extractor import extract_pdf
 from document_analysis.service import DocumentAnalysisService
 
@@ -123,6 +123,41 @@ def test_text_from_boxes_reconstructs_reading_order() -> None:
     )
 
     assert text_from_boxes(result) == "Hello World"
+
+
+def test_lines_from_result_merges_drifted_cells_but_keeps_rows_apart() -> None:
+    """A printed row whose cells drift a couple of px must stay one line.
+
+    300 DPI scans put a row's cells at slightly different baselines. With fixed
+    pixel buckets such a row straddled the bucket edge and was torn in two,
+    which the statement pipeline then read as a row with no description and no
+    balance. The merge tolerance scales with the glyph height instead.
+    """
+
+    def _box(x0: float, y0: float, y1: float) -> list[list[float]]:
+        return [[x0, y0], [x0 + 60, y0], [x0 + 60, y1], [x0, y1]]
+
+    # Row 1 cells drift 2px around y=100; row 2 sits a full line pitch below.
+    result = _BoxResult(
+        boxes=[
+            _box(10, 90, 108),  # 10/05  (y 90-108)
+            _box(120, 92, 110),  # CHECK 1234 (drifts 2px lower)
+            _box(400, 91, 109),  # 9.98
+            _box(500, 92, 110),  # 807.08
+            _box(10, 130, 148),  # 10/06 (next row, far enough to stay apart)
+            _box(120, 131, 149),  # POS PURCHASE
+        ],
+        txts=["10/05", "CHECK 1234", "9.98", "807.08", "10/06", "POS PURCHASE"],
+    )
+
+    lines = lines_from_result(result)
+
+    assert [[str(token["text"]) for token in line] for line in lines] == [
+        ["10/05", "CHECK 1234", "9.98", "807.08"],
+        ["10/06", "POS PURCHASE"],
+    ]
+    # Coordinates survive so the column-aware extractor can read the amounts.
+    assert [round(float(line[-1]["cx"])) for line in lines] == [530, 150]
 
 
 def _png_bytes() -> bytes:

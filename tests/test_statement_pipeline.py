@@ -341,6 +341,179 @@ def test_supporting_sections_reconciliation_warning() -> None:
     assert any("Checks Paid totals" in warning for warning in statement.warnings), statement.warnings
 
 
+# ----------------------------------------------------------------------
+# US-layout statements (the shape of the scanned sample PDF)
+# ----------------------------------------------------------------------
+# The figures below are arithmetically self-consistent: the balance column
+# chains from the 69.96 opening balance to the 575.57 closing balance, and
+# every page-2 detail total equals the matching page-1 column sum. The only
+# deliberate defect is the interest credit, printed as "26" the way the scan
+# of dummy_statement.pdf loses the leading "0." - the detail section's "0.26"
+# is what the running balance proves.
+US_PAGE1 = """\
+FIRST NATIONAL BANK
+Account Number: 12345678
+JAMES C. MORRISON
+1765 SHERIDAN DRIVE
+YOUR CITY, USA 03087
+Statement Period: October 10 to November 9
+Summary of Your Account
+Average Balance 5043.24
+Beginning balance on October 10 $69.96 Avg Collected Balance $643.24
+Ending balance on November 9 $345.10 Average Balance for APY $643.24
+Date Description Debit Credit Balance
+10/02 POS PURCHASE 4.23 0.00 65.73
+10/03 PREAUTHORIZED CREDIT 0.00 763.01 828.74
+10/05 CHECK 1234 9.98 0.00 818.76
+10/05 POS PURCHASE 25.50 0.00 793.26
+10/12 CHECK 1236 69.00 0.00 724.26
+10/14 CHECK 1237 180.63 0.00 543.63
+10/16 PREAUTHORIZED CREDIT 0.00 763.01 1306.64
+10/22 ATM WITHDRAWAL 140.00 0.00 1166.64
+10/28 CHECK 1238 91.06 0.00 1075.58
+10/30 CHECK 1239 451.20 0.00 624.38
+10/30 CHECK 1246 37.07 0.00 587.31
+10/31 CHECK 1247 100.00 0.00 487.31
+10/31 CHECK 1248 78.24 0.00 409.07
+11/02 CHECK 1249 52.23 0.00 356.84
+11/09 INTERESTCREDIT 0.00 26.00 357.10
+11/09 SERVICE CHARGE 12.00 0.00 345.10
+"""
+
+US_PAGE2 = """\
+Deposits and Other Credits
+Date Description Amount
+10/03 PREAUTHORIZED CREDIT PAYROLL 0987654 678990 763.01
+10/16 PREAUTHORIZED CREDIT US TREASURY 310 SOC SEC 02080 763.01
+11/09 INTEREST CREDIT 0.26
+Withdrawals and Other Debits
+Date Description Amount
+10/02 POS PURCHASE TERMINAL 24349201 WAL-MART#3492 4.23
+10/05 POS PURCHASE TERMINAL 422443 KWAN COURT WICHITA KS 25.50
+10/22 ATM WITHDRAWAL CASH WITHDRAWAL TERMINAL S78476 3216 140.00
+Account Service Charges and Fees
+Date Description Amount
+11/09 SERVICE CHARGE 12.00
+Checks Paid (*indicates out of sequence)
+Check # Date Amount Check # Date Amount Check # Date Amount
+1234 10/05 $9.98 1238 10/28 $91.06 1247 10/31 $100.00
+1236* 10/12 $69.00 1239 10/30 $451.20 1248 10/31 $78.24
+1237 10/14 $180.63 1246* 10/30 $37.07 1249 11/02 $52.23
+"""
+
+
+def test_us_layout_holder_and_dated_summary_balances() -> None:
+    """Label-less name block and "Balance on <date>" summary are both read."""
+    statement = BankStatementProcessor().process_text(US_PAGE1 + PAGE_BREAK + US_PAGE2, "us.txt")
+
+    assert statement.account_holder_name == "JAMES C. MORRISON"
+    assert statement.account_number == "12345678"
+    assert statement.opening_balance == 69.96
+    assert statement.closing_balance == 345.10
+    assert statement.statement_period == "October 10 to November 9"
+    assert statement.validation["expected_closing_balance"] == 345.10
+
+
+def test_us_layout_period_falls_back_to_dated_summary() -> None:
+    """With no "Statement Period" line the summary dates supply the period."""
+    without_period = "\n".join(
+        line for line in US_PAGE1.splitlines() if not line.startswith("Statement Period")
+    )
+    statement = BankStatementProcessor().process_text(without_period + PAGE_BREAK + US_PAGE2, "us2.txt")
+    assert statement.statement_period == "October 10 to November 9"
+
+
+def test_us_layout_detail_sections_never_enter_the_primary_table() -> None:
+    """Page-2 detail rows, including their column headers, stay out of the rows."""
+    statement = BankStatementProcessor().process_text(US_PAGE1 + PAGE_BREAK + US_PAGE2, "us3.txt")
+
+    assert [item.description for item in statement.transactions] == [
+        "POS PURCHASE",
+        "PREAUTHORIZED CREDIT",
+        "CHECK 1234",
+        "POS PURCHASE",
+        "CHECK 1236",
+        "CHECK 1237",
+        "PREAUTHORIZED CREDIT",
+        "ATM WITHDRAWAL",
+        "CHECK 1238",
+        "CHECK 1239",
+        "CHECK 1246",
+        "CHECK 1247",
+        "CHECK 1248",
+        "CHECK 1249",
+        "INTERESTCREDIT",
+        "SERVICE CHARGE",
+    ]
+    # A bare "Date Description Amount" header inside a detail section must not
+    # reopen the primary table, so no header, terminal id or check number
+    # survives as a description, and no "Transaction" row is invented.
+    assert not any("Description" in item.description for item in statement.transactions)
+    assert not any("Transaction" in item.description for item in statement.transactions)
+    # Ungrouped 4-digit amounts keep their decimal point (1306.64, not 130.0).
+    assert [item.balance for item in statement.transactions] == [
+        65.73, 828.74, 818.76, 793.26, 724.26, 543.63, 1306.64, 1166.64,
+        1075.58, 624.38, 587.31, 487.31, 409.07, 356.84, 357.10, 345.10,  # fmt: skip
+    ]
+
+
+def test_us_layout_checks_triplet_ledger_is_read_positionally() -> None:
+    """"Checks Paid" printed as Check#/Date/Amount triplets parses per check."""
+    statement = BankStatementProcessor().process_text(US_PAGE1 + PAGE_BREAK + US_PAGE2, "us4.txt")
+    assert [
+        (item.date, item.description, item.debit_amount)
+        for item in statement.supporting_sections.checks
+    ] == [
+        ("10/05", "CHECK 1234", 9.98),
+        ("10/28", "CHECK 1238", 91.06),
+        ("10/31", "CHECK 1247", 100.00),
+        ("10/12", "CHECK 1236", 69.00),
+        ("10/30", "CHECK 1239", 451.20),
+        ("10/31", "CHECK 1248", 78.24),
+        ("10/14", "CHECK 1237", 180.63),
+        ("10/30", "CHECK 1246", 37.07),
+        ("11/02", "CHECK 1249", 52.23),
+    ]
+    # The out-of-sequence marker belongs to the check number, not the amount.
+    assert sum(item.debit_amount for item in statement.supporting_sections.checks) == pytest.approx(1069.41)
+    # All nine checks are in the primary table, so the cross-check stays silent.
+    assert not any("Checks Paid totals" in warning for warning in statement.warnings), statement.warnings
+
+
+def test_us_layout_detail_amount_repairs_misread_cell_and_reports_it() -> None:
+    """A lost glyph is repaired from the statement itself, never silently."""
+    statement = BankStatementProcessor().process_text(US_PAGE1 + PAGE_BREAK + US_PAGE2, "us5.txt")
+    interest = next(item for item in statement.transactions if item.date == "11/09" and item.credit_amount)
+
+    # "0.26" was read as "26"; the detail section supplies the real figure.
+    assert interest.credit_amount == 0.26
+    assert interest.balance == 357.10
+    repair = next(warning for warning in statement.warnings if "detail section" in warning)
+    assert "0.26" in repair and "26.00" in repair
+    # Every row now follows the running balance and the totals still reconcile.
+    assert statement.validation["balance_mismatches"] == 0
+    assert statement.validation["expected_closing_balance"] == 345.10
+    assert statement.as_summary()["total_credit"] == pytest.approx(763.01 + 763.01 + 0.26)
+    assert statement.as_summary()["total_debit"] == pytest.approx(1251.14)
+    assert not any("do not match" in warning for warning in statement.warnings), statement.warnings
+
+
+def test_balance_summary_line_after_the_table_is_not_a_description() -> None:
+    """"Ending balance" printed under the table is a label, not a row tail."""
+    text = (
+        "HDFC BANK\n"
+        f"Account No: {ACCOUNT_NUMBER}\n"
+        "Date Description Debit Credit Balance\n"
+        "10/02 POS PURCHASE 500.00 0.00 9500.00\n"
+        "Opening Balance: 10000.00\n"
+        "Ending Balance on November 9 $9500.00\n"
+        "Average Collected Balance $9100.00\n"
+    )
+    statement = BankStatementProcessor().process_text(text, "tail.txt")
+    assert [item.description for item in statement.transactions] == ["POS PURCHASE"]
+    assert statement.closing_balance == 9500.0
+
+
 def test_quality_score_beats_row_count() -> None:
     """A small validated candidate wins over a larger all-garbage candidate."""
     processor = BankStatementProcessor()

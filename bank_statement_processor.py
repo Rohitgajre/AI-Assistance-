@@ -87,9 +87,11 @@ _DATE_TOKEN = re.compile(
 )
 
 # Money-looking text used for *cell* values (a trusted column position).
+# Ungrouped amounts ("1216.92") are valid here because the column already told us
+# the cell holds money; the 9+ digit guard lives in ``_cell_amount``.
 _MONEY_TOKEN = re.compile(
     r"(?:₹|inr|rs\.?\s*)?"
-    r"\(?\d{1,3}(?:,\d{2,3})*"
+    r"\(?\d{1,8}(?:,\d{2,3})*"
     r"(?:\.\d{1,2})?"
     r"\)?(?:\s*(?:cr|dr))?",
     re.IGNORECASE,
@@ -97,9 +99,18 @@ _MONEY_TOKEN = re.compile(
 
 # Lines that are never transaction rows (totals, page footers, float rows).
 _NOISE_LINE = re.compile(
-    r"(opening\s+balance|closing\s+balance|brought\s+forward|carried\s+forward|"
+    r"(beginning\s+balance|ending\s+balance|starting\s+balance|"
+    r"opening\s+balance|closing\s+balance|brought\s+forward|carried\s+forward|"
     r"\btotal\b|page\s+\d+|statement\s+summary|this\s+is\s+a\s+computer|"
     r"b/f\b|c/f\b|transaction\s+count|no\.?\s+of\s+transactions)",
+    re.IGNORECASE,
+)
+
+# Statement summary lines that name a balance or carry one forward. They are
+# labels, not rows, so they must never be appended to the row above them.
+_BALANCE_LABEL_RE = re.compile(
+    r"\b(?:(?:beginning|opening|starting|ending|closing)\s+balance|"
+    r"brought\s+forward|carried\s+forward)\b",
     re.IGNORECASE,
 )
 
@@ -136,6 +147,39 @@ _REF_LABEL_RE = re.compile(
 )
 
 _IFSC = re.compile(r"\b([A-Z]{4}0[A-Z0-9]{6})\b")
+
+# One "check number, date, amount" triplet of a "Checks Paid" ledger, which US
+# statements print three (or more) per line.
+_CHECK_TRIPLET_RE = re.compile(
+    r"(\d{3,6}\*?)\s+(\d{1,2}[/-]\d{1,2})\s+\$?\s*([\d,]+(?:\.\d{1,2})?)"
+)
+
+# Summary blocks that name the opening/closing balance together with the day it
+# applies to ("Beginning balance on October 10  $69.96") instead of using a
+# plain label such as "Opening Balance: 10000.00".
+_DATED_BALANCE_RE = re.compile(
+    r"(?im)\b(?P<label>beginning|opening|starting|ending|closing)\s+balance\b"
+    r"(?:\s+(?:on|as\s+of|for)\s+[A-Za-z]+\.?\s+\d{1,2}(?:\s*,?\s*\d{4})?)?"
+    r"[^\n\d]*(?P<amount>\d[\d,]*(?:\.\d{1,2})?)"
+)
+_DATED_BALANCE_DATE_RE = re.compile(
+    r"(?im)\b(?P<label>beginning|opening|starting|ending|closing)\s+balance\s+"
+    r"(?:on|as\s+of|for)\s+(?P<date>[A-Za-z]+\.?\s+\d{1,2}(?:\s*,?\s*\d{4})?)"
+)
+
+# Label-less account-holder block: 2-4 capitalised words directly above an
+# address line, used by statements that print no "Account Holder Name:" label.
+_NAME_BLOCK_LINES = 20  # how far below the header block to look for the name
+_HOLDER_NAME_RE = re.compile(r"^[A-Z][A-Za-z.'-]*(?: [A-Z][A-Za-z.'-]*){1,3}$")
+_HOLDER_BLOCKLIST_RE = re.compile(
+    r"(?i)\b(bank|statement|account|page|date|summary|balance|deposit|withdraw|"
+    r"check|charge|fee|interest|activity|transaction|customer|branch|period|"
+    r"address|phone|email|www|http)\b"
+)
+_ADDRESS_LINE_RE = re.compile(
+    r"(?i)(?:\b\d{1,6}\s+[A-Za-z]|\b(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|"
+    r"boulevard|blvd|way|court|ct|place|pl)\b|,\s*[A-Za-z .]*\s*\d{5}(?:-\d{4})?$)"
+)
 _ACCOUNT_NO = re.compile(
     r"(?:account\s*(?:no\.?|number|#)|a/c(?:\s*no\.?)?|acct\.?\s*no\.?)\s*[:\-]?\s*"
     r"([A-Z0-9Xx*]{6,22})",
@@ -146,6 +190,12 @@ _HOLDER = re.compile(
     re.IGNORECASE,
 )
 _BANK_NAME = re.compile(r"^.*\bBANK\b.*$", re.IGNORECASE | re.MULTILINE)
+
+# Descriptions that belong to a dedicated detail section rather than to the
+# "withdrawals and other debits" bucket of a primary table.
+_CHECK_OR_FEE_RE = re.compile(
+    r"(?i)\b(check|chq|cheque|checque|fee|service charge|charges)\b"
+)
 
 # Text that should never survive as a transaction description.
 _SECONDARY_TEXT_RE = re.compile(
@@ -693,6 +743,9 @@ class BankStatementProcessor:
         valid_rows, dropped = self._validate_transaction_rows(best_rows)
         self._normalize_balances(valid_rows)
 
+        supporting = self._parse_supporting_sections(sections)
+        repairs = self._reconcile_amounts_from_sections(valid_rows, supporting)
+
         statement = BankStatement(
             file_name=file_name,
             document_type=document_type,
@@ -706,8 +759,8 @@ class BankStatementProcessor:
         if not statement.transactions:
             statement.warnings.append("No transaction rows could be parsed from this document.")
 
-        supporting = self._parse_supporting_sections(sections)
         statement.supporting_sections = supporting
+        statement.warnings.extend(repairs)
 
         parse_dropped = self._count_unparsed_date_rows(primary_text)
         validation = self._build_validation(statement, full_text, dropped, supporting, parse_dropped)
@@ -722,6 +775,52 @@ class BankStatementProcessor:
     # Page & section detection
     # ------------------------------------------------------------------
 
+    def _section_roles(self, page: str) -> list[tuple[int, str | None, str]]:
+        """Label every non-empty line of one page with the region it belongs to.
+
+        Returns ``(line_index, region, text)`` tuples so callers that work on
+        parallel arrays (such as the OCR token lines) stay index-aligned. The
+        region is ``"table"`` for the primary transaction table, one of the
+        ``_SUPPORTING_SECTION_KEYS`` for a detail section, and ``None`` for
+        letterhead/summary text that belongs to neither. The state machine is
+        per page: a new page starts in an unknown zone and the next explicit
+        section title decides what belongs where.
+
+        Only an explicit title switches regions. A bare column-header line
+        ("Date Description Amount") inside a detail section stays in that
+        section - treating it as a new primary table is what used to drag every
+        page-2 detail row into the exported transaction list. Summary lines such
+        as "- Withdrawals and other debits 1,320.02" carry a date or an amount,
+        so they are data, not a section title, and never open a section.
+        """
+        section_keys = {key for key, _ in _SUPPORTING_SECTION_KEYS}
+        roles: list[tuple[int, str | None, str]] = []
+        current: str | None = None
+        for index, raw in enumerate(page.splitlines()):
+            line = raw.strip()
+            if not line:
+                continue
+            section_key = None
+            if _DATE_TOKEN.search(line) is None and _MONEY_TOKEN.search(line) is None:
+                section_key = next(
+                    (
+                        key
+                        for key, pattern in _SUPPORTING_SECTION_KEYS
+                        if re.search(pattern, line, re.I)
+                    ),
+                    None,
+                )
+            if section_key:
+                current = section_key
+                continue
+            if _SUMMARY_SECTION_RE.search(line):
+                current = None
+                continue
+            if _PRIMARY_TABLE_HEADER_LINE.search(line) and current not in section_keys:
+                current = "table"
+            roles.append((index, current, line))
+        return roles
+
     def _detect_sections(self, pages: list[str]) -> tuple[str, dict[str, list[str]]]:
         """Split OCR/native text into the primary table and supporting sections.
 
@@ -732,39 +831,17 @@ class BankStatementProcessor:
         """
         sections: dict[str, list[str]] = {key: [] for key, _ in _SUPPORTING_SECTION_KEYS}
         primary_lines: list[str] = []
-        current: str | None = None
 
-        for page_index, page in enumerate(pages):
-            if page_index > 0:
-                # A new page starts in an unknown zone; the next explicit header
-                # (or section title) decides what belongs where.
-                current = None
-            for raw in page.splitlines():
-                line = raw.strip()
-                if not line:
-                    continue
-                section_key = next(
-                    (key for key, pattern in _SUPPORTING_SECTION_KEYS if re.search(pattern, line, re.I)),
-                    None,
-                )
-                if section_key:
-                    current = section_key
-                    continue
-                if _SUMMARY_SECTION_RE.search(line):
-                    current = None
-                    continue
-                if _PRIMARY_TABLE_HEADER_LINE.search(line):
-                    current = "table"
-                    primary_lines.append(line)
-                    continue
-                if current == "table":
+        for page in pages:
+            for _index, region, line in self._section_roles(page):
+                if region == "table":
                     # Keep the row out of the primary region entirely: totals,
                     # page numbers, "opening balance" headers are not rows.
                     if _NOISE_LINE.search(line) and _DATE_TOKEN.search(line) is None:
                         continue
                     primary_lines.append(line)
-                elif current in sections:
-                    sections[current].append(line)
+                elif region in sections:
+                    sections[region].append(line)
 
         if not primary_lines:
             # No header found (unusual layout / OCR missed it). Fall back to all
@@ -787,13 +864,63 @@ class BankStatementProcessor:
         """Parse page-2 detail sections into structures for cross-checking only."""
         result = SupportingSections()
         for key in ("deposits", "withdrawals", "fees", "checks"):
-            text = "\n".join(sections.get(key, []))
-            if not text.strip():
+            lines = sections.get(key, [])
+            if not any(line.strip() for line in lines):
                 continue
-            rows = self._extract_transactions(text)
+            rows = (
+                self._parse_check_ledger(lines)
+                if key == "checks"
+                else self._extract_transactions("\n".join(lines))
+            )
             valid, _dropped = self._validate_transaction_rows(rows)
             setattr(result, key, valid)
         return result
+
+    def _parse_check_ledger(self, lines: list[str]) -> list[Transaction]:
+        """Parse a "Checks Paid" list printed as ``Check # | Date | Amount``.
+
+        US statements print the checks side by side - three or more
+        check/date/amount triplets per printed line. The generic line parser
+        cannot see that structure and turns the check numbers into debits, which
+        poisons the cross-check against the primary table, so the triplets are
+        read positionally here. Statements that print "10/05 CHECK 1234 750.00"
+        instead keep using the generic parser.
+        """
+        header = next(
+            (
+                line
+                for line in lines
+                if re.search(r"check\s*#|check\s+no", line, re.I) and re.search(r"date", line, re.I)
+            ),
+            "",
+        )
+        if not header:
+            # Plain "10/05 CHECK 1234 750.00" list: the generic parser reads it.
+            return self._extract_transactions("\n".join(lines))
+        transactions: list[Transaction] = []
+        for line in lines:
+            matches = list(_CHECK_TRIPLET_RE.finditer(line))
+            if not matches and not _DATE_TOKEN.search(line):
+                continue
+            found = False
+            for match in matches:
+                date_value = self._normalize_date(match.group(2))
+                amount = abs(self._to_decimal(match.group(3)))
+                if date_value is None or amount == 0:
+                    continue
+                number = match.group(1).rstrip("*")
+                transactions.append(
+                    Transaction(
+                        date=date_value,
+                        description=f"CHECK {number}".strip(),
+                        debit_amount=amount,
+                    )
+                )
+                found = True
+            if found:
+                continue
+            transactions.extend(self._extract_transactions(line))
+        return transactions
 
     # ------------------------------------------------------------------
     # Metadata extraction
@@ -814,11 +941,30 @@ class BankStatementProcessor:
     @staticmethod
     def _extract_holder(text: str) -> str | None:
         match = _HOLDER.search(text)
-        if not match:
-            return None
-        value = match.group(1).strip(" :-")
-        value = re.split(r"\s{2,}|Account|IFSC|Branch", value, maxsplit=1)[0].strip()
-        return value or None
+        if match:
+            value = match.group(1).strip(" :-")
+            value = re.split(r"\s{2,}|Account|IFSC|Branch", value, maxsplit=1)[0].strip()
+            if value:
+                return value
+        return BankStatementProcessor._holder_from_address_block(text)
+
+    @staticmethod
+    def _holder_from_address_block(text: str) -> str | None:
+        """Read the holder from a label-less name/address block.
+
+        US statements print the name straight above the mailing address
+        ("JAMES C. MORRISON" / "1765 SHERIDAN DRIVE") with no "Account Holder"
+        label at all. A candidate name must be 2-4 capitalised words, carry no
+        statement vocabulary, and be immediately followed by an address line -
+        which keeps letterhead ("Statement of Account") out of the result.
+        """
+        lines = [line.strip() for line in text.splitlines() if line.strip()][:_NAME_BLOCK_LINES]
+        for index, line in enumerate(lines[:-1]):
+            if not _HOLDER_NAME_RE.match(line) or _HOLDER_BLOCKLIST_RE.search(line):
+                continue
+            if _ADDRESS_LINE_RE.search(lines[index + 1]):
+                return line
+        return None
 
     @staticmethod
     def _extract_account_number(text: str) -> str | None:
@@ -883,8 +1029,7 @@ class BankStatementProcessor:
                 transactions.append(parsed)
 
         for line in lines[start:]:
-            lowered = line.lower()
-            if re.search(r"opening\s+balance|closing\s+balance|brought\s+forward|carried\s+forward", lowered):
+            if _BALANCE_LABEL_RE.search(line):
                 continue
             if _NOISE_LINE.search(line) and _DATE_TOKEN.search(line) is None:
                 continue
@@ -902,7 +1047,7 @@ class BankStatementProcessor:
         for index, match in enumerate(matches):
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             chunk = re.sub(r"\s+", " ", text[match.start() : end]).strip()
-            if re.search(r"opening\s+balance|closing\s+balance|brought\s+forward|carried\s+forward", chunk, re.I):
+            if _BALANCE_LABEL_RE.search(chunk):
                 continue
             parsed = self._parse_transaction_chunk(chunk)
             if parsed is not None:
@@ -928,7 +1073,7 @@ class BankStatementProcessor:
             return None
         return Transaction(
             date=date_value,
-            description=re.sub(r"\s+", " ", description).strip() or "Transaction",
+            description=self._clean_description(description),
             debit_amount=debit,
             credit_amount=credit,
             balance=balance,
@@ -1398,7 +1543,7 @@ class BankStatementProcessor:
                 return None
             return Transaction(
                 date=date_value,
-                description=re.sub(r"\s+", " ", description).strip() or "Transaction",
+                description=self._clean_description(description),
                 debit_amount=debit,
                 credit_amount=credit,
                 balance=balance,
@@ -1424,12 +1569,30 @@ class BankStatementProcessor:
                 mapping["amount"] = index
         return mapping if "date" in mapping and ("debit" in mapping or "credit" in mapping or "amount" in mapping) else {}
 
+    @staticmethod
+    def _clean_description(description: str) -> str:
+        """Normalise a description cell, dropping a leading date token.
+
+        OCR regularly glues the date and the narration into one box
+        ("10/04 POS PURCHASE"), which would otherwise export a duplicated date
+        in the description column.
+        """
+        text = re.sub(r"\s+", " ", description or "").strip()
+        if text:
+            match = _DATE_TOKEN.match(text)
+            if match:
+                text = text[match.end() :].strip(" -|:")
+        return text or "Transaction"
+
     def _cell_amount(self, cells: list[str], index: int | None) -> float:
         if index is None or index >= len(cells) or not cells[index]:
             return 0.0
         match = _MONEY_TOKEN.search(cells[index])
         if match:
-            return self._to_decimal(match.group(0))
+            token = match.group(0)
+            if len(re.sub(r"\D", "", token)) < 9:
+                return self._to_decimal(token)
+            return 0.0  # reference/terminal id in an amount column
         if self._looks_like_amount(cells[index]):
             return self._to_decimal(cells[index])
         return 0.0
@@ -1442,10 +1605,34 @@ class BankStatementProcessor:
         self,
         box_pages: list[list[list[dict[str, float | str]]]],
     ) -> list[Transaction]:
+        """Parse the primary table of every page from OCR box coordinates.
+
+        Only the lines the section state machine marks as the primary table are
+        used, so the page-2 detail sections cannot be re-read here as extra
+        transactions with column positions that do not exist.
+        """
         transactions: list[Transaction] = []
-        for page_lines in box_pages:
+        for page_lines in self._primary_table_box_lines(box_pages):
             transactions.extend(self._transactions_from_box_lines(page_lines))
         return self._dedupe(transactions)
+
+    def _primary_table_box_lines(
+        self,
+        box_pages: list[list[list[dict[str, float | str]]]],
+    ) -> list[list[list[dict[str, float | str]]]]:
+        """Keep only the primary-table OCR lines of each page."""
+        selected_pages: list[list[list[dict[str, float | str]]]] = []
+        for page_lines in box_pages:
+            texts = [
+                " ".join(str(token.get("text", "")) for token in line) for line in page_lines
+            ]
+            selected: list[list[dict[str, float | str]]] = []
+            for index, region, _text in self._section_roles("\n".join(texts)):
+                if region == "table" and index < len(page_lines):
+                    selected.append(page_lines[index])
+            if selected:
+                selected_pages.append(selected)
+        return selected_pages
 
     def _transactions_from_box_lines(
         self,
@@ -1749,15 +1936,105 @@ class BankStatementProcessor:
         return None
 
     @staticmethod
+    def _extract_dated_summary_balances(text: str) -> tuple[float | None, float | None]:
+        """Read "Beginning balance on <date> $X" / "Ending balance on <date> $Y".
+
+        Summary blocks of this style print a second figure on the same printed
+        line ("Avg Collected Balance $643.24"), so the amount is read directly
+        after the label instead of as the last number of the line.
+        """
+        opening: float | None = None
+        closing: float | None = None
+        for match in _DATED_BALANCE_RE.finditer(text):
+            value = BankStatementProcessor._to_decimal(match.group("amount"))
+            if match.group("label").lower().startswith(("begin", "open", "start")):
+                opening = value if opening is None else opening
+            else:
+                closing = value if closing is None else closing
+        return opening, closing
+
+    @staticmethod
     def _extract_period(text: str) -> str | None:
         pattern = re.compile(
             r"(?:statement\s+(?:period|date)\s*[:\-]?\s*)([^:\n]{4,40}?)\s+(?:to|through)\s+([^:\n]{4,40})",
             re.I,
         )
         match = pattern.search(text)
-        if not match:
-            return None
-        return f"{match.group(1).strip()} to {match.group(2).strip()}"[:80]
+        if match:
+            return f"{match.group(1).strip()} to {match.group(2).strip()}"[:80]
+        # Fall back to the dates the summary block attaches to the balances.
+        dates: dict[str, str] = {}
+        for match in _DATED_BALANCE_DATE_RE.finditer(text):
+            label = match.group("label").lower()
+            key = "start" if label.startswith(("begin", "open", "start")) else "end"
+            dates.setdefault(key, re.sub(r"\s+", " ", match.group("date")).strip())
+        if "start" in dates and "end" in dates:
+            return f"{dates['start']} to {dates['end']}"[:80]
+        return None
+
+    def _reconcile_amounts_from_sections(
+        self,
+        rows: list[Transaction],
+        sections: SupportingSections,
+    ) -> list[str]:
+        """Adopt a detail-section amount when the running balance proves it.
+
+        A scanned cell occasionally loses a glyph: "0.26" is read as "26", which
+        breaks the running-balance arithmetic for that row only. Nothing is
+        invented here - the replacement value is copied from the statement's own
+        detail section, for the same date and the same side of the account, and
+        it is accepted only when it makes the arithmetic exact to the paisa.
+        Every change is reported as a warning so the correction stays visible.
+        """
+        detail_debits: dict[str, list[float]] = {}
+        detail_credits: dict[str, list[float]] = {}
+        for group, sink in (
+            (sections.withdrawals, detail_debits),
+            (sections.fees, detail_debits),
+            (sections.checks, detail_debits),
+            (sections.deposits, detail_credits),
+        ):
+            for item in group:
+                if item.debit_amount:
+                    sink.setdefault(item.date, []).append(item.debit_amount)
+                if item.credit_amount:
+                    sink.setdefault(item.date, []).append(item.credit_amount)
+        if not (detail_debits or detail_credits):
+            return []
+
+        notes: list[str] = []
+        previous: Transaction | None = None
+        for row in rows:
+            if previous is not None and previous.balance and row.balance:
+                expected = round(previous.balance - row.debit_amount + row.credit_amount, 2)
+                if abs(expected - row.balance) > _BALANCE_TOLERANCE:
+                    is_debit = row.debit_amount > 0
+                    current_amount = row.debit_amount if is_debit else row.credit_amount
+                    other_amount = row.credit_amount if is_debit else row.debit_amount
+                    for candidate in (detail_debits if is_debit else detail_credits).get(
+                        row.date, []
+                    ):
+                        if candidate == current_amount:
+                            continue
+                        fixed = round(
+                            previous.balance - candidate + other_amount
+                            if is_debit
+                            else previous.balance - other_amount + candidate,
+                            2,
+                        )
+                        if abs(fixed - row.balance) <= _BALANCE_TOLERANCE:
+                            if is_debit:
+                                row.debit_amount = candidate
+                            else:
+                                row.credit_amount = candidate
+                            notes.append(
+                                f"{row.date}: {candidate:,.2f} was read from the statement's "
+                                f"detail section (OCR misread {current_amount:,.2f}); the "
+                                "running balance now reconciles."
+                            )
+                            break
+            previous = row
+        return notes
 
     @staticmethod
     def _reconciliation_warnings(
@@ -1790,15 +2067,34 @@ class BankStatementProcessor:
                 )
         if sections.withdrawals:
             section_debits = sum(item.debit_amount for item in sections.withdrawals)
+            # "Withdrawals and other debits" lists every cash-out row on US
+            # statements but only ATM/cash rows on others, so the section total
+            # is accepted when it matches the cash withdrawals, the non-fee
+            # debits, or the debits that are neither checks nor fees (the US
+            # layout, where cheques have their own section).
             primary_atm = sum(
                 item.debit_amount
                 for item in primary
                 if re.search(r"\b(atm|withdrawal)\b", item.description, re.I)
             )
-            if abs(primary_atm - section_debits) > _BALANCE_TOLERANCE:
+            primary_other_debits = sum(
+                item.debit_amount
+                for item in primary
+                if not re.search(r"\b(fee|service charge|charges)\b", item.description, re.I)
+            )
+            primary_cash_debits = sum(
+                item.debit_amount
+                for item in primary
+                if not _CHECK_OR_FEE_RE.search(item.description)
+            )
+            if all(
+                abs(candidate - section_debits) > _BALANCE_TOLERANCE
+                for candidate in (primary_atm, primary_other_debits, primary_cash_debits)
+            ):
                 warnings.append(
                     f"Withdrawals and Other Debits totals ({section_debits:,.2f}) do not match "
-                    f"primary-table ATM/withdrawal debits ({primary_atm:,.2f})."
+                    f"primary-table debits ({primary_atm:,.2f} cash withdrawals / "
+                    f"{primary_cash_debits:,.2f} non-check debits)."
                 )
         if sections.fees:
             section_fees = sum(item.debit_amount + item.credit_amount for item in sections.fees)
@@ -1825,6 +2121,12 @@ class BankStatementProcessor:
         rows = statement.transactions
         opening = self._extract_balance_label(full_text, "opening")
         closing = self._extract_balance_label(full_text, "closing")
+        if opening is None or closing is None:
+            # Fall back to the summary block that names the day each balance
+            # applies to ("Beginning balance on October 10 $69.96").
+            dated_opening, dated_closing = self._extract_dated_summary_balances(full_text)
+            opening = dated_opening if opening is None else opening
+            closing = dated_closing if closing is None else closing
         credits = sum(item.credit_amount for item in rows)
         debits = sum(item.debit_amount for item in rows)
         fees = (

@@ -13,14 +13,19 @@ through the same path everywhere (document analysis and bank statements).
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 # Hardcoded engine tuning. Not environment-driven: the OCR stack is meant to
 # behave identically everywhere without configuration.
-_RENDER_ZOOM = 2.0  # pymupdf rasterization scale for scanned PDF pages
-_LINE_BUCKET = 12  # vertical tolerance in px used to reconstruct text lines
+_MIN_RENDER_ZOOM = 2.0  # floor for pymupdf rasterization of scanned PDF pages
+_MAX_RENDER_ZOOM = 5.0  # ceiling: beyond this there is nothing left to resolve
+_MAX_RENDER_PIXELS = 12_000_000  # per-page pixel budget (keeps memory bounded)
+_LINE_MERGE_RATIO = 0.4  # line tolerance as a fraction of the median glyph height
+_LINE_MIN_TOLERANCE = 3.0  # px; absorbs the 1-2px drift inside a printed row
+_LINE_MAX_TOLERANCE = 12.0
 _MIN_LONG_SIDE = 800  # upscale images smaller than this for better recognition
 _MAX_LONG_SIDE = 2400  # cap upscaling so memory stays bounded
 _UPSCALE_FACTOR = 2.0
@@ -61,7 +66,15 @@ def ocr_pdf(pdf_bytes: bytes, password: str = "") -> list[str]:
 
 
 def rasterize_pdf(pdf_bytes: bytes, password: str = "") -> list[Any]:
-    """Render every PDF page to a PIL image; public so callers can inspect pages."""
+    """Render every PDF page to a PIL image; public so callers can inspect pages.
+
+    Scanned pages are rasterized at the *native* resolution of the embedded
+    scan instead of an arbitrary fixed zoom. A 300 DPI letter page is stored as
+    ~2550x3300 pixels, so a 2x zoom would hand the recognizer a downscaled,
+    blurrier image and silently lose thin glyphs (decimal points, asterisks).
+    The zoom is bounded below (so thin vector pages still get upscaled) and by a
+    total pixel budget (so huge pages cannot blow up memory).
+    """
     try:
         import pymupdf
     except ImportError as error:
@@ -73,15 +86,64 @@ def rasterize_pdf(pdf_bytes: bytes, password: str = "") -> list[Any]:
     _unlock_pdf(document, password)
     images: list[Any] = []
     for page in document:
-        pixmap = page.get_pixmap(
-            matrix=pymupdf.Matrix(_RENDER_ZOOM, _RENDER_ZOOM), alpha=False
-        )
+        zoom = _render_zoom(page)
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False)
         from PIL import Image
 
         images.append(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
     if not images:
         raise ValueError("The PDF has no pages to read.")
     return images
+
+
+def _render_zoom(page: object) -> float:
+    """Zoom that renders a scanned page at (at most) its embedded image DPI."""
+    try:
+        width_pt = float(getattr(getattr(page, "rect", None), "width", 0.0) or 0.0)
+        height_pt = float(getattr(getattr(page, "rect", None), "height", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return _MIN_RENDER_ZOOM
+    if width_pt <= 0 or height_pt <= 0:
+        return _MIN_RENDER_ZOOM
+
+    zoom = _MIN_RENDER_ZOOM
+    for pixels, placed in _page_image_geometry(page, width_pt):
+        if pixels > 0 and placed > 0:
+            zoom = max(zoom, pixels / placed)
+    zoom = min(zoom, _MAX_RENDER_ZOOM)
+
+    budget = math.sqrt(_MAX_RENDER_PIXELS / (width_pt * height_pt))
+    return max(min(zoom, budget), _MIN_RENDER_ZOOM)
+
+
+def _page_image_geometry(page: object, width_pt: float) -> list[tuple[int, float]]:
+    """Return ``(pixel_width, placed_width_pt)`` for every image on the page."""
+    geometry: list[tuple[int, float]] = []
+    try:
+        infos = page.get_image_info()  # pymupdf >= 1.19
+    except Exception:
+        infos = []
+    for info in infos or []:
+        try:
+            pixels = int(info.get("width", 0))
+            bbox = info.get("bbox") or ()
+            placed = float(bbox[2]) - float(bbox[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        if pixels > 0 and placed > 0:
+            geometry.append((pixels, placed))
+    if geometry:
+        return geometry
+
+    # Older pymupdf: assume each image covers the whole page.
+    try:
+        for image in page.get_images(full=True) or []:
+            pixels = int(image[2])
+            if pixels > 0 and width_pt > 0:
+                geometry.append((pixels, width_pt))
+    except Exception:
+        return []
+    return geometry
 
 
 def _tokens_from_result(result: object) -> list[dict[str, float | str]]:
@@ -137,26 +199,48 @@ def lines_from_result(result: object) -> list[list[dict[str, float | str]]]:
     Returns a list of lines; every line is a list of token dicts (see
     ``_tokens_from_result``) already sorted left-to-right. Consumers that need
     column-aware table extraction can use the ``cx`` values directly.
+
+    Tokens are merged while their vertical centres stay within a tolerance
+    derived from the median glyph height. Fixed pixel buckets were not good
+    enough: a printed row whose cells differ by a single pixel (very common
+    after a 300 DPI fax scan) straddled a bucket edge and was torn into two
+    "lines", which then read as a transaction with no description and no
+    balance. The tolerance now scales with the text, so the drift is absorbed
+    while genuinely different rows (a full line pitch apart) stay apart.
     """
     tokens = _tokens_from_result(result)
     if not tokens:
         return []
-    tokens.sort(key=lambda item: (round(float(item["cy"]) / _LINE_BUCKET), float(item["cx"])))
+    tolerance = _line_tolerance(tokens)
+    tokens.sort(key=lambda item: (float(item["cy"]), float(item["cx"])))
+
     lines: list[list[dict[str, float | str]]] = []
-    current_key: int | None = None
+    centers: list[float] = []
     for token in tokens:
-        key = int(round(float(token["cy"]) / _LINE_BUCKET))
-        if current_key is None or key == current_key:
-            if current_key is None:
-                current_key = key
-                lines.append([])
+        center = float(token["cy"])
+        if lines and abs(center - centers[-1]) <= tolerance:
             lines[-1].append(token)
+            count = len(lines[-1])
+            centers[-1] += (center - centers[-1]) / count
             continue
         lines.append([token])
-        current_key = key
+        centers.append(center)
     for line in lines:
         line.sort(key=lambda item: float(item["cx"]))
     return lines
+
+
+def _line_tolerance(tokens: list[dict[str, float | str]]) -> float:
+    """Vertical merge tolerance (px) for one page, scaled to its glyph size."""
+    heights = sorted(
+        float(token["y1"]) - float(token["y0"])
+        for token in tokens
+        if float(token.get("y1", 0.0)) > float(token.get("y0", 0.0))
+    )
+    if not heights:
+        return _LINE_MAX_TOLERANCE
+    median = heights[len(heights) // 2]
+    return min(_LINE_MAX_TOLERANCE, max(_LINE_MIN_TOLERANCE, _LINE_MERGE_RATIO * median))
 
 
 def ocr_image_lines(image: Any) -> list[list[dict[str, float | str]]]:
