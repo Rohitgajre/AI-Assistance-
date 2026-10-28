@@ -18,7 +18,7 @@ async def app(scope: dict[str, Any], receive: Any, send: Any) -> None:
 
     body = json.dumps({
         "status": "ok",
-        "message": "AskBuddy is running via Streamlit. Use 'streamlit run AI_chatbot.py' locally.",
+        "message": "Nebula AI is running via Streamlit. Use 'streamlit run AI_chatbot.py' locally.",
     }).encode("utf-8")
 
     await send({

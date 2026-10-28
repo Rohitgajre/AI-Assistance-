@@ -13,3 +13,20 @@ rapidocr>=3,<4
 onnxruntime>=1.17,<2
 pytest>=8,<9
 ruff>=0.8,<1
+
+# Generic document intelligence
+docling>=2.0,<3
+chromadb>=0.5,<1
+sentence-transformers>=3.0,<4
+langchain>=0.3,<1
+langchain-core>=0.3,<1
+langchain-community>=0.3,<1
+tavily-python>=0.5,<1
+pydantic>=2.0,<3
+httpx>=0.27,<1
+numpy>=1.26,<3
+pandas>=2.0,<3
+scikit-learn>=1.4,<2
+sqlalchemy>=2.0,<3
+aiofiles>=24.1,<25
+rich>=13.0,<15

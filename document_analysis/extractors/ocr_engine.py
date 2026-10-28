@@ -12,6 +12,7 @@ through the same path everywhere (document analysis and bank statements).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from typing import Any
@@ -34,6 +35,10 @@ _RAPID_OCR: Any | None = None
 _TESSERACT_PROBED = False
 _TESSERACT_AVAILABLE = False
 
+# One OCR pass per PDF, shared by the text and the boxed-line APIs.
+_OCR_PDF_CACHE_LIMIT = 3
+_OCR_PDF_CACHE: dict[bytes, list[tuple[str, list[list[dict[str, float | str]]]]]] = {}
+
 
 class OCRUnavailableError(RuntimeError):
     """Raised when the underlying OCR backend cannot be started."""
@@ -53,16 +58,53 @@ def ocr_image(image: Any) -> str:
 
 def ocr_pdf(pdf_bytes: bytes, password: str = "") -> list[str]:
     """OCR every page of a scanned PDF and return one text string per page."""
-    from PIL import Image
-
-    parts: list[str] = []
-    for image in rasterize_pdf(pdf_bytes, password):
-        text = ocr_image(image) if isinstance(image, Image.Image) else ""
-        if text:
-            parts.append(text)
+    parts = [text for text, _lines in ocr_pdf_pages(pdf_bytes, password) if text.strip()]
     if not parts:
         raise ValueError("No readable text was found in the scanned PDF.")
     return parts
+
+
+def ocr_pdf_pages(
+    pdf_bytes: bytes,
+    password: str = "",
+) -> list[tuple[str, list[list[dict[str, float | str]]]]]:
+    """OCR a PDF exactly once, returning ``(text, lines)`` for every page.
+
+    The plain-text and the coordinate-preserving APIs both derive from this
+    single pass, memoized by content hash. The statement pipeline used to OCR
+    the same scanned pages two to four times (once for text, once for boxes,
+    then again for the scanned fallback), so a one-minute upload became a
+    several-minute one with no progress shown anywhere.
+    """
+    key = hashlib.sha256(pdf_bytes).digest() + b"\x00" + password.encode("utf-8", "ignore")
+    cached = _OCR_PDF_CACHE.get(key)
+    if cached is not None:
+        logger.info("OCR cache hit (%d pages) — reusing previous scan", len(cached))
+        return cached
+
+    from PIL import Image
+
+    images = rasterize_pdf(pdf_bytes, password)
+    total = len(images)
+    pages: list[tuple[str, list[list[dict[str, float | str]]]]] = []
+    for index, image in enumerate(images, start=1):
+        if not isinstance(image, Image.Image):
+            pages.append(("", []))
+            continue
+        logger.info("OCR page %d/%d", index, total)
+        lines = ocr_image_lines(image)
+        text = "\n".join(" ".join(str(token["text"]) for token in line) for line in lines).strip()
+        if not text:
+            # No boxed text: fall back to the plain recognizer, then Tesseract
+            # (only when a real binary is installed).
+            prepared = _prepare_image(image)
+            text = _ocr_with_rapidocr(prepared).strip() or _ocr_with_tesseract(prepared).strip()
+        pages.append((text, lines))
+
+    if len(_OCR_PDF_CACHE) >= _OCR_PDF_CACHE_LIMIT:
+        _OCR_PDF_CACHE.pop(next(iter(_OCR_PDF_CACHE)))
+    _OCR_PDF_CACHE[key] = pages
+    return pages
 
 
 def rasterize_pdf(pdf_bytes: bytes, password: str = "") -> list[Any]:
@@ -267,15 +309,7 @@ def ocr_pdf_lines(
     password: str = "",
 ) -> list[list[list[dict[str, float | str]]]]:
     """OCR every page and return per-page line records with coordinates."""
-    from PIL import Image
-
-    pages: list[list[list[dict[str, float | str]]]] = []
-    for image in rasterize_pdf(pdf_bytes, password):
-        if isinstance(image, Image.Image):
-            lines = ocr_image_lines(image)
-            if lines:
-                pages.append(lines)
-    return pages
+    return [lines for _text, lines in ocr_pdf_pages(pdf_bytes, password) if lines]
 
 
 def _engine() -> Any:

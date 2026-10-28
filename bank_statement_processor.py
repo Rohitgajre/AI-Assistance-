@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import math
 import re
+import time
 import warnings
 from collections import Counter, defaultdict
 from collections.abc import Iterable
@@ -37,6 +39,8 @@ try:
     from openpyxl import Workbook
 except ImportError:  # pragma: no cover - optional dependency in testing env
     Workbook = None
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -109,7 +113,7 @@ _NOISE_LINE = re.compile(
 # Statement summary lines that name a balance or carry one forward. They are
 # labels, not rows, so they must never be appended to the row above them.
 _BALANCE_LABEL_RE = re.compile(
-    r"\b(?:(?:beginning|opening|starting|ending|closing)\s+balance|"
+    r"\b(?:(?:beginning|opening|starting|ending|closing|average|collected|available|ledger)\s+balance|"
     r"brought\s+forward|carried\s+forward)\b",
     re.IGNORECASE,
 )
@@ -563,6 +567,13 @@ class BankStatementProcessor:
         if not pdf_bytes or b"%PDF" not in pdf_bytes[:1024]:
             raise ValueError("That file is not a readable PDF. Export or unlock the statement and try again.")
 
+        started = time.perf_counter()
+        logger.info(
+            "Statement PDF %s: %.1f KB — extracting text (scanned pages are OCR'd, this can take a while)",
+            file_name,
+            len(pdf_bytes) / 1024,
+        )
+
         try:
             text_pages, used_ocr = self._read_pdf_pages(pdf_bytes, password)
         except ValueError:
@@ -576,6 +587,13 @@ class BankStatementProcessor:
                 "No readable text was found in this PDF. If it is password-protected, enter the password "
                 "in Settings and upload again."
             )
+        logger.info(
+            "Statement PDF %s: %d page(s) read via %s in %.1fs",
+            file_name,
+            len(text_pages),
+            "OCR" if used_ocr else "native text",
+            time.perf_counter() - started,
+        )
 
         boxes = self._ocr_pdf_lines(pdf_bytes, password) or None if used_ocr else None
         table_candidate = self._extract_transactions_from_pdf_tables(pdf_bytes, password) or None
@@ -585,6 +603,12 @@ class BankStatementProcessor:
             document_type="image" if used_ocr else "text",
             boxes=boxes,
             table_candidate=table_candidate,
+        )
+        logger.info(
+            "Statement PDF %s: %d transaction(s) after primary parse in %.1fs",
+            file_name,
+            len(statement.transactions),
+            time.perf_counter() - started,
         )
 
         # Scanned fallback for "text" PDFs that yielded too few transactions:
@@ -609,6 +633,12 @@ class BankStatementProcessor:
         if used_ocr:
             statement.document_type = "image"
             statement.warnings.append("Image-based PDF detected; text was recovered with OCR.")
+        logger.info(
+            "Statement PDF %s: done — %d transaction(s) in %.1fs",
+            file_name,
+            len(statement.transactions),
+            time.perf_counter() - started,
+        )
         return statement
 
     def detect_pdf_type(self, pdf_bytes: bytes, password: str = "") -> str:
